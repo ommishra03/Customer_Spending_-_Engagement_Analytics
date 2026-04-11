@@ -32,9 +32,17 @@ import shap
 from flask import Flask, jsonify, request
 from sklearn.ensemble import RandomForestClassifier
 
-from dataset.feature_engineering import MODEL_FEATURE_COLUMNS, ensure_features_dataset
+from dataset.feature_engineering import (
+    MODEL_FEATURE_COLUMNS,
+    apply_missing_feature_defaults,
+    configure_logging,
+    ensure_features_dataset,
+)
 
 logger = logging.getLogger(__name__)
+
+# Console logging for API debugging (respect LOG_LEVEL; idempotent if Flask already configured).
+configure_logging()
 
 # Single source of truth for model inputs (dataset/feature_engineering.py).
 FEATURES = list(MODEL_FEATURE_COLUMNS)
@@ -145,11 +153,20 @@ def load_bundle() -> ModelBundle:
     if _bundle is not None:
         return _bundle
     csv_path = Path(_default_features_csv())
+    logger.info("Loading bundle; ensuring features at %s", csv_path)
     ensure_features_dataset(csv_path, _repo_root())
     df = pd.read_csv(csv_path)
     missing = [c for c in FEATURES if c not in df.columns]
     if missing:
-        raise RuntimeError(f"Features CSV still missing columns after repair: {missing}")
+        logger.warning(
+            "Features still missing after ensure_features_dataset: %s — applying defaults",
+            missing,
+        )
+        df = apply_missing_feature_defaults(df)
+        df.to_csv(csv_path, index=False)
+        logger.info("Persisted default-filled features to %s", csv_path)
+    else:
+        df = apply_missing_feature_defaults(df)
     model = _load_model(df)
     X = df[FEATURES].copy()
     df = df.copy()
