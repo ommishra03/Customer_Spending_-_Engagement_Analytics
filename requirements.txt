@@ -1,11 +1,28 @@
-pandas
-numpy
-matplotlib
-seaborn
-scikit-learn
-jupyter
+# Core Data Processing
+pandas>=2.0
+numpy>=1.24
+
+# Visualization (for notebooks / analysis)
+matplotlib>=3.7
+seaborn>=0.12
+
+# Machine Learning
+scikit-learn>=1.3
+xgboost>=1.7
+lightgbm>=4.0
+
+# Explainable AI
+shap>=0.43
+
+# Backend API
 flask>=3.0
-joblib
-shap
-xgboost
-lightgbm
+flask-cors>=4.0
+
+# Model Persistence
+joblib>=1.3
+
+# Notebook Environment
+jupyter>=1.0
+
+# Optional (recommended for pipeline stability)
+python-dotenv>=1.0
