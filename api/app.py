@@ -1,8 +1,13 @@
 """
 Flask API equivalent of dashboard/app.py (Streamlit churn intelligence).
 
-Set CHURN_MODEL_PATH and CHURN_FEATURES_CSV if defaults do not match your layout.
-Defaults: <repo>/dashboard/model.pkl and <repo>/dataset/processed/credit_card_features.csv
+Environment:
+- CHURN_FEATURES_CSV — override path to the engineered feature table (default:
+  dataset/processed/credit_card_features.csv). Missing columns trigger an
+  automatic rebuild via dataset/feature_engineering.py.
+- CHURN_MODEL_PATH — joblib model path. If the file is missing, a small
+  RandomForest is trained in-memory from the CSV (needs Attrition_Flag). Set
+  CHURN_DISABLE_STUB_MODEL=1 to require a real saved model instead.
 """
 
 from __future__ import annotations
@@ -14,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import logging
+
 import joblib
 import matplotlib
 
@@ -23,17 +30,14 @@ import numpy as np
 import pandas as pd
 import shap
 from flask import Flask, jsonify, request
+from sklearn.ensemble import RandomForestClassifier
 
-FEATURES = [
-    "Transaction_Velocity",
-    "Engagement",
-    "Avg_Utilization_Ratio",
-    "Months_Inactive_12_mon",
-    "Transaction_Drift",
-    "Spend_Drift",
-    "Engagement_Drift",
-    "Behavioral_Risk_Score",
-]
+from dataset.feature_engineering import MODEL_FEATURE_COLUMNS, ensure_features_dataset
+
+logger = logging.getLogger(__name__)
+
+# Single source of truth for model inputs (dataset/feature_engineering.py).
+FEATURES = list(MODEL_FEATURE_COLUMNS)
 
 RISK_BINS = [0, 0.3, 0.6, 1.0]
 RISK_LABELS = ["Low Risk", "Medium Risk", "High Risk"]
@@ -66,7 +70,6 @@ class ModelBundle:
 
 
 _bundle: ModelBundle | None = None
-_load_error: str | None = None
 
 
 def _expected_positive_base(explainer: shap.TreeExplainer) -> float:
@@ -91,49 +94,85 @@ def _shap_values_for_positive_class(
     return arr
 
 
+def _train_stub_model(df: pd.DataFrame) -> RandomForestClassifier:
+    """
+    If no model.pkl is present, fit a small tree ensemble on the same CSV.
+
+    This keeps /health green in a fresh checkout. Set CHURN_DISABLE_STUB_MODEL=1
+    to require a real joblib model on disk instead.
+    """
+    if "Attrition_Flag" not in df.columns:
+        raise ValueError(
+            "Stub training needs Attrition_Flag in the features CSV "
+            "(rebuild from dataset/processed/credit_card_clean.csv)."
+        )
+    X = df[FEATURES].to_numpy(dtype=float)
+    y = (df["Attrition_Flag"].astype(str) == "Attrited Customer").astype(int)
+    model = RandomForestClassifier(
+        n_estimators=80,
+        max_depth=10,
+        random_state=42,
+        class_weight="balanced_subsample",
+        n_jobs=-1,
+    )
+    model.fit(X, y)
+    logger.warning(
+        "Using in-memory stub RandomForest (no file at CHURN_MODEL_PATH). "
+        "Train your real model and save joblib, or set CHURN_DISABLE_STUB_MODEL=1 to fail fast."
+    )
+    return model
+
+
+def _load_model(df: pd.DataFrame) -> Any:
+    model_path = _default_model_path()
+    if os.path.isfile(model_path):
+        return joblib.load(model_path)
+    disable = os.environ.get("CHURN_DISABLE_STUB_MODEL", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if disable:
+        raise FileNotFoundError(
+            f"Model not found at {model_path} and stub model is disabled "
+            "(CHURN_DISABLE_STUB_MODEL)."
+        )
+    return _train_stub_model(df)
+
+
 def load_bundle() -> ModelBundle:
-    global _bundle, _load_error
+    global _bundle
     if _bundle is not None:
         return _bundle
-    if _load_error is not None:
-        raise RuntimeError(_load_error)
-    model_path = _default_model_path()
-    csv_path = _default_features_csv()
-    try:
-        if not os.path.isfile(model_path):
-            raise FileNotFoundError(f"Model not found: {model_path}")
-        if not os.path.isfile(csv_path):
-            raise FileNotFoundError(f"Features CSV not found: {csv_path}")
-        model = joblib.load(model_path)
-        df = pd.read_csv(csv_path)
-        missing = [c for c in FEATURES if c not in df.columns]
-        if missing:
-            raise ValueError(f"CSV missing required feature columns: {missing}")
-        X = df[FEATURES].copy()
-        df = df.copy()
-        df["Churn_Prob"] = model.predict_proba(X)[:, 1]
-        df["Risk_Segment"] = pd.cut(
-            df["Churn_Prob"], bins=RISK_BINS, labels=RISK_LABELS, include_lowest=True
-        )
-        explainer = shap.TreeExplainer(model)
-        shap_matrix = _shap_values_for_positive_class(explainer, X)
-        _bundle = ModelBundle(
-            model=model,
-            df=df,
-            X=X,
-            explainer=explainer,
-            shap_matrix=shap_matrix,
-        )
-        return _bundle
-    except Exception as exc:  # noqa: BLE001
-        _load_error = str(exc)
-        raise RuntimeError(_load_error) from exc
+    csv_path = Path(_default_features_csv())
+    ensure_features_dataset(csv_path, _repo_root())
+    df = pd.read_csv(csv_path)
+    missing = [c for c in FEATURES if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"Features CSV still missing columns after repair: {missing}")
+    model = _load_model(df)
+    X = df[FEATURES].copy()
+    df = df.copy()
+    df["Churn_Prob"] = model.predict_proba(X)[:, 1]
+    df["Risk_Segment"] = pd.cut(
+        df["Churn_Prob"], bins=RISK_BINS, labels=RISK_LABELS, include_lowest=True
+    )
+    explainer = shap.TreeExplainer(model)
+    shap_matrix = _shap_values_for_positive_class(explainer, X)
+    _bundle = ModelBundle(
+        model=model,
+        df=df,
+        X=X,
+        explainer=explainer,
+        shap_matrix=shap_matrix,
+    )
+    return _bundle
 
 
 def _require_bundle() -> ModelBundle:
     try:
         return load_bundle()
-    except RuntimeError as e:
+    except (RuntimeError, FileNotFoundError, ValueError, OSError) as e:
         raise ApiNotReady(str(e)) from e
 
 
@@ -144,6 +183,20 @@ class ApiNotReady(Exception):
 def create_app() -> Flask:
     app = Flask(__name__)
 
+    @app.route("/")
+    def home():
+        return jsonify({
+            "message": "Customer Analytics API is running 🚀",
+            "status": "success",
+            "available_endpoints": [
+                "/health",
+                "/api/meta",
+                "/api/summary",
+                "/api/predict",
+                "/api/customers"
+            ]
+        })
+
     @app.errorhandler(ApiNotReady)
     def handle_not_ready(err: ApiNotReady):
         return jsonify({"error": str(err)}), 503
@@ -153,7 +206,7 @@ def create_app() -> Flask:
         try:
             load_bundle()
             return jsonify({"status": "ok"})
-        except RuntimeError as e:
+        except (RuntimeError, FileNotFoundError, ValueError, OSError) as e:
             return jsonify({"status": "degraded", "detail": str(e)}), 503
 
     @app.get("/api/meta")
